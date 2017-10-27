@@ -74,7 +74,7 @@ where
                 (k, Mutex::new(v))
             }).collect::<HashMap<_,_>>());
         let inner_fold = Arc::new(inner_fold);
-        let mut receivers = vec![];
+        let mut receivers = Vec::with_capacity(num_jobs);
 
         //launch the workers
         for id in 0..num_jobs {
