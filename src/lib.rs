@@ -58,9 +58,11 @@ where
             current_slot += (current_slot + 1) % num_jobs;
         }
 
-        if hopper.len() < num_jobs {
-            num_jobs = hopper.len();
-        }
+        let num_jobs = if hopper.len() < num_jobs {
+            hopper.len()
+        } else {
+            num_jobs
+        };
 
         //convert the hopper to use mutexes so the threads can drain the queues
         let hopper: Arc<HashMap<usize, Mutex<VecDeque<T>>>> =
