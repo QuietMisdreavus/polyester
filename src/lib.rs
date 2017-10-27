@@ -4,6 +4,28 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::channel;
 
+fn hopper<I, T>(iter: I, slots: usize) -> Arc<HashMap<usize, Mutex<VecDeque<T>>>>
+where
+    I: Iterator<Item=T>,
+{
+    let mut hopper = HashMap::new();
+
+    //load up the hopper with items for the workers
+    //TODO: don't drain the iterator first?
+    let mut current_slot = 0;
+    for item in iter {
+        hopper.entry(current_slot)
+              .or_insert_with(VecDeque::new)
+              .push_back(item);
+        current_slot += (current_slot + 1) % slots;
+    }
+
+    //convert the hopper to use mutexes so the threads can drain the queues
+    Arc::new(hopper.into_iter().map(|(k, v)| {
+        (k, Mutex::new(v))
+    }).collect())
+}
+
 /// A trait to extend `Iterator`s with consumers that work in parallel.
 pub trait Polyester<T> {
     /// Fold the iterator in parallel.
@@ -45,36 +67,23 @@ where
         InnerFold: Fn(Acc, T) -> Acc + Send + Sync + 'static,
         OuterFold: Fn(Acc, Acc) -> Acc
     {
-        let mut hopper = HashMap::new();
         let num_jobs = num_cpus::get();
 
         if num_jobs == 1 {
+            //it's not worth collecting the items into the hopper and spawning a thread if it's
+            //still going to be serial, just fold it inline
             return self.fold(seed, inner_fold);
         }
 
-        //load up the hopper with items for the workers
-        //TODO: don't drain the iterator first?
-        let mut current_slot = 0;
-        for item in self {
-            hopper.entry(current_slot)
-                  .or_insert_with(VecDeque::new)
-                  .push_back(item);
-            current_slot += (current_slot + 1) % num_jobs;
-        }
+        let hopper = hopper(self, num_jobs);
+        let inner_fold = Arc::new(inner_fold);
+        let (report, recv) = channel();
 
         let num_jobs = if hopper.len() < num_jobs {
             hopper.len()
         } else {
             num_jobs
         };
-
-        //convert the hopper to use mutexes so the threads can drain the queues
-        let hopper: Arc<HashMap<usize, Mutex<VecDeque<T>>>> =
-            Arc::new(hopper.into_iter().map(|(k, v)| {
-                (k, Mutex::new(v))
-            }).collect::<HashMap<_,_>>());
-        let inner_fold = Arc::new(inner_fold);
-        let (report, recv) = channel();
 
         //launch the workers
         for id in 0..num_jobs {
