@@ -74,15 +74,14 @@ where
                 (k, Mutex::new(v))
             }).collect::<HashMap<_,_>>());
         let inner_fold = Arc::new(inner_fold);
-        let mut receivers = Vec::with_capacity(num_jobs);
+        let (report, recv) = channel();
 
         //launch the workers
         for id in 0..num_jobs {
             let hopper = hopper.clone();
             let acc = seed.clone();
             let inner_fold = inner_fold.clone();
-            let (report, recv) = channel();
-            receivers.push(recv);
+            let report = report.clone();
             std::thread::spawn(move || {
                 let mut acc = acc;
 
@@ -106,15 +105,16 @@ where
             });
         }
 
+        //hang up our initial channel so we don't wait for a response from it
+        drop(report);
+
         //collect and fold the workers' results
         let mut acc: Option<Acc> = None;
-        for recv in receivers {
-            if let Ok(res) = recv.recv() {
-                if acc.is_none() {
-                    acc = Some(res);
-                } else {
-                    acc = acc.map(|acc| outer_fold(acc, res));
-                }
+        for res in recv.iter() {
+            if acc.is_none() {
+                acc = Some(res);
+            } else {
+                acc = acc.map(|acc| outer_fold(acc, res));
             }
         }
 
