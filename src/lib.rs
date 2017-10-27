@@ -1,29 +1,29 @@
 extern crate num_cpus;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::channel;
 
-fn hopper<I, T>(iter: I, slots: usize) -> Arc<HashMap<usize, Mutex<VecDeque<T>>>>
+fn hopper<I, T>(iter: I, slots: usize) -> Arc<Vec<Mutex<VecDeque<T>>>>
 where
     I: Iterator<Item=T>,
 {
-    let mut hopper = HashMap::new();
+    let mut hopper = Vec::with_capacity(slots);
+
+    for _ in 0..slots {
+        hopper.push(VecDeque::new());
+    }
 
     //load up the hopper with items for the workers
     //TODO: don't drain the iterator first?
     let mut current_slot = 0;
     for item in iter {
-        hopper.entry(current_slot)
-              .or_insert_with(VecDeque::new)
-              .push_back(item);
+        hopper[current_slot].push_back(item);
         current_slot += (current_slot + 1) % slots;
     }
 
     //convert the hopper to use mutexes so the threads can drain the queues
-    Arc::new(hopper.into_iter().map(|(k, v)| {
-        (k, Mutex::new(v))
-    }).collect())
+    Arc::new(hopper.into_iter().map(|v| { Mutex::new(v) }).collect())
 }
 
 /// A trait to extend `Iterator`s with consumers that work in parallel.
@@ -96,7 +96,7 @@ where
 
                 loop {
                     let item = {
-                        match hopper[&id].lock() {
+                        match hopper[id].lock() {
                             Ok(mut queue) => if let Some(item) = queue.pop_front() {
                                 item
                             } else {
