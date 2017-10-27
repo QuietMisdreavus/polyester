@@ -48,6 +48,10 @@ where
         let mut hopper = HashMap::new();
         let num_jobs = num_cpus::get();
 
+        if num_jobs == 1 {
+            return self.fold(seed, inner_fold);
+        }
+
         //load up the hopper with items for the workers
         //TODO: don't drain the iterator first?
         let mut current_slot = 0;
