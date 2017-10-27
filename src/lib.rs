@@ -121,3 +121,16 @@ where
         acc.unwrap_or(seed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Polyester;
+
+    #[test]
+    fn basic_fold() {
+        let par = (0..1_000_000).par_fold(0usize, |l,r| l+r, |l,r| l+r);
+        let seq = (0..1_000_000).fold(0usize, |l,r| l+r);
+
+        assert_eq!(par, seq);
+    }
+}
