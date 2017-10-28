@@ -1,7 +1,7 @@
 extern crate num_cpus;
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Condvar, mpsc};
+use std::sync::{Arc, Mutex, Condvar, LockResult, mpsc};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
@@ -48,14 +48,10 @@ impl<T> Hopper<T> {
             let mut current_slot = 0;
 
             for item in iter {
-                match hopper.cache[current_slot].lock() {
-                    Ok(mut queue) => {
-                        queue.push_back(item);
-                        hopper.signals[current_slot].notify_one();
-                    }
-                    //TODO: poison renders a queue inert, should i do something different?
-                    Err(_) => (),
-                }
+                let mut queue = guts(hopper.cache[current_slot].lock());
+                queue.push_back(item);
+
+                hopper.signals[current_slot].notify_one();
 
                 current_slot = (current_slot + 1) % slots;
             }
@@ -73,25 +69,16 @@ impl<T> Hopper<T> {
     /// Loads an item from the given cache slot, potentially blocking while the cache-filler worker
     /// adds more items.
     fn get_item(&self, id: usize) -> Option<T> {
-        match self.cache[id].lock() {
-            Ok(mut queue) => loop {
-                //TODO: work-stealing
-                if let Some(item) = queue.pop_front() {
-                    return Some(item);
-                } else if self.ready.load(SeqCst) {
-                    return None;
-                }
+        let mut queue = guts(self.cache[id].lock());
+        loop {
+            //TODO: work-stealing
+            if let Some(item) = queue.pop_front() {
+                return Some(item);
+            } else if self.ready.load(SeqCst) {
+                return None;
+            }
 
-                queue = if let Ok(q) = self.signals[id].wait(queue) {
-                    q
-                } else {
-                    //TODO: poison will lose an entire batch of items, should i do something
-                    //different?
-                    return None;
-                };
-            },
-            //TODO: poison will lose an entire batch of items, should i do something different?
-            Err(_) => None,
+            queue = guts(self.signals[id].wait(queue));
         }
     }
 }
@@ -266,6 +253,23 @@ where
         }
 
         self.recv.as_mut().and_then(|r| r.next())
+    }
+}
+
+///Unwrap a LockResult to get the MutexGuard even when poisonsed.
+///
+///I don't anticipate ever poisoning my mutexes, but the alternative of just using unwrap gives me
+///the creeps, so here we are.
+///
+///Source for the name: http://bulbapedia.bulbagarden.net/wiki/Guts_(Ability)
+///
+///Note that this is literally copy/pasted from synchronoise, where the name makes slightly more
+///sense.
+pub fn guts<T>(res: LockResult<T>) -> T {
+    match res {
+        Ok(guard) => guard,
+        //The Pokemon's Guts raises its Attack!
+        Err(poison) => poison.into_inner(),
     }
 }
 
