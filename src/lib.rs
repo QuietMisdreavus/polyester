@@ -285,22 +285,43 @@ pub fn guts<T>(res: LockResult<T>) -> T {
 #[cfg(test)]
 mod tests {
     use super::Polyester;
+    use std::time::{Instant, Duration};
+
+    fn secs_millis(dur: Duration) -> (u64, u32) {
+        (dur.as_secs(), dur.subsec_nanos() / 1_000_000)
+    }
 
     #[test]
     fn basic_fold() {
+        let before = Instant::now();
         let par = (0..1_000_000).par_fold(0usize, |l,r| l+r, |l,r| l+r);
+        let after_par = Instant::now();
         let seq = (0..1_000_000).fold(0usize, |l,r| l+r);
+        let after_seq = Instant::now();
+
+        let par_dur = secs_millis(after_par.duration_since(before));
+        let seq_dur = secs_millis(after_seq.duration_since(after_par));
+        println!("parallel fold:   {}.{:04}s", par_dur.0, par_dur.1);
+        println!("sequential fold: {}.{:04}s", seq_dur.0, seq_dur.1);
 
         assert_eq!(par, seq);
     }
 
     #[test]
     fn basic_map() {
+        let before = Instant::now();
         let mut par = (0..1_000_000).par_map(|x| x*x).collect::<Vec<usize>>();
+        let after_par = Instant::now();
         let mut seq = (0..1_000_000).map(|x| x*x).collect::<Vec<usize>>();
+        let after_seq = Instant::now();
 
         par.sort();
         seq.sort();
+
+        let par_dur = secs_millis(after_par.duration_since(before));
+        let seq_dur = secs_millis(after_seq.duration_since(after_par));
+        println!("parallel map:   {}.{:04}s", par_dur.0, par_dur.1);
+        println!("sequential map: {}.{:04}s", seq_dur.0, seq_dur.1);
 
         assert_eq!(par, seq);
     }
