@@ -46,14 +46,23 @@ impl<T> Hopper<T> {
         thread::spawn(move || {
             let hopper = hopper;
             let mut current_slot = 0;
+            let mut rounds = 0usize;
 
             for item in iter {
-                let mut queue = guts(hopper.cache[current_slot].lock());
-                queue.push_back(item);
-
-                hopper.signals[current_slot].notify_one();
+                {
+                    let mut queue = guts(hopper.cache[current_slot].lock());
+                    queue.push_back(item);
+                }
 
                 current_slot = (current_slot + 1) % slots;
+
+                if current_slot == 0 {
+                    rounds += 1;
+                }
+
+                if (rounds % (slots * 2)) == 0 {
+                    hopper.signals[current_slot].notify_all();
+                }
             }
 
             hopper.ready.store(true, SeqCst);
