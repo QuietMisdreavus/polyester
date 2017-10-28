@@ -1,43 +1,98 @@
 extern crate num_cpus;
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Condvar, mpsc};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
+use std::thread;
 
-type Hopper<T> = Arc<Vec<Mutex<VecDeque<T>>>>;
-
-fn hopper<I, T>(iter: I, slots: usize) -> Hopper<T>
-where
-    I: Iterator<Item=T>,
-{
-    let mut hopper = Vec::with_capacity(slots);
-
-    for _ in 0..slots {
-        hopper.push(VecDeque::new());
-    }
-
-    //load up the hopper with items for the workers
-    //TODO: don't drain the iterator first?
-    let mut current_slot = 0;
-    for item in iter {
-        hopper[current_slot].push_back(item);
-        current_slot += (current_slot + 1) % slots;
-    }
-
-    //convert the hopper to use mutexes so the threads can drain the queues
-    Arc::new(hopper.into_iter().map(|v| { Mutex::new(v) }).collect())
+/// A distributed cache of an iterator's items, meant to be filled by a background thread so that
+/// worker threads can pull from a per-thread cache.
+struct Hopper<T> {
+    /// The cache of items, broken down into per-thread sub-caches.
+    cache: Vec<Mutex<VecDeque<T>>>,
+    /// A set of associated `Condvar`s for worker threads to wait on while the background thread
+    /// adds more items to its cache.
+    signals: Vec<Condvar>,
+    /// A signal that tells whether or not the source iterator has been exhausted.
+    ready: AtomicBool,
 }
 
-fn get_item<T>(hopper: &Hopper<T>, id: usize) -> Option<T> {
-    match hopper[id].lock() {
-        Ok(mut queue) => if let Some(item) = queue.pop_front() {
-            Some(item)
-        } else {
-            //TODO: work-stealing
-            None
-        },
-        //TODO: poison will lose an entire batch of items, should i do something different?
-        Err(_) => None,
+impl<T> Hopper<T> {
+    /// Creates a new `Hopper` from the given iterator, with the given number of slots, and begins
+    /// the background cache-filler worker.
+    fn new<I>(iter: I, slots: usize) -> Arc<Hopper<T>>
+    where
+        I: Iterator<Item=T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut cache = Vec::with_capacity(slots);
+        let mut signals = Vec::<Condvar>::with_capacity(slots);
+
+        for _ in 0..slots {
+            cache.push(Mutex::new(VecDeque::new()));
+            signals.push(Condvar::new());
+        }
+
+        let ret = Arc::new(Hopper {
+            cache,
+            signals,
+            ready: AtomicBool::new(false),
+        });
+
+        let hopper = ret.clone();
+
+        thread::spawn(move || {
+            let hopper = hopper;
+            let mut current_slot = 0;
+
+            for item in iter {
+                match hopper.cache[current_slot].lock() {
+                    Ok(mut queue) => {
+                        queue.push_back(item);
+                        hopper.signals[current_slot].notify_one();
+                    }
+                    //TODO: poison renders a queue inert, should i do something different?
+                    Err(_) => (),
+                }
+
+                current_slot = (current_slot + 1) % slots;
+            }
+
+            hopper.ready.store(true, SeqCst);
+
+            for signal in &hopper.signals {
+                signal.notify_all();
+            }
+        });
+
+        ret
+    }
+
+    /// Loads an item from the given cache slot, potentially blocking while the cache-filler worker
+    /// adds more items.
+    fn get_item(&self, id: usize) -> Option<T> {
+        match self.cache[id].lock() {
+            Ok(mut queue) => loop {
+                //TODO: work-stealing
+                if let Some(item) = queue.pop_front() {
+                    return Some(item);
+                } else if self.ready.load(SeqCst) {
+                    return None;
+                }
+
+                queue = if let Ok(q) = self.signals[id].wait(queue) {
+                    q
+                } else {
+                    //TODO: poison will lose an entire batch of items, should i do something
+                    //different?
+                    return None;
+                };
+            },
+            //TODO: poison will lose an entire batch of items, should i do something different?
+            Err(_) => None,
+        }
     }
 }
 
@@ -85,7 +140,7 @@ pub trait Polyester<T>
 
 impl<T, I> Polyester<T> for I
 where
-    I: Iterator<Item=T>
+    I: Iterator<Item=T> + Send + 'static,
 {
     fn par_fold<Acc, InnerFold, OuterFold>(
         self,
@@ -107,15 +162,9 @@ where
             return self.fold(seed, inner_fold);
         }
 
-        let hopper = hopper(self, num_jobs);
+        let hopper = Hopper::new(self, num_jobs);
         let inner_fold = Arc::new(inner_fold);
         let (report, recv) = channel();
-
-        let num_jobs = if hopper.len() < num_jobs {
-            hopper.len()
-        } else {
-            num_jobs
-        };
 
         //launch the workers
         for id in 0..num_jobs {
@@ -127,7 +176,7 @@ where
                 let mut acc = acc;
 
                 loop {
-                    let item = get_item(&hopper, id);
+                    let item = hopper.get_item(id);
 
                     if let Some(item) = item {
                         acc = inner_fold(acc, item);
@@ -180,7 +229,7 @@ pub struct ParMap<Iter, Map, T>
 
 impl<Iter, Map, T> Iterator for ParMap<Iter, Map, T>
 where
-    Iter: Iterator,
+    Iter: Iterator + Send + 'static,
     Iter::Item: Send + 'static,
     Map: Fn(Iter::Item) -> T + Send + Sync + 'static,
     T: Send + 'static,
@@ -191,15 +240,9 @@ where
         if let (Some(iter), Some(map)) = (self.iter.take(), self.map.take()) {
             let num_jobs = num_cpus::get();
 
-            let hopper = hopper(iter, num_jobs);
+            let hopper = Hopper::new(iter, num_jobs);
             let map = Arc::new(map);
             let (report, recv) = channel();
-
-            let num_jobs = if hopper.len() < num_jobs {
-                hopper.len()
-            } else {
-                num_jobs
-            };
 
             //launch the workers
             for id in 0..num_jobs {
@@ -208,7 +251,7 @@ where
                 let map = map.clone();
                 std::thread::spawn(move || {
                     loop {
-                        let item = get_item(&hopper, id);
+                        let item = hopper.get_item(id);
 
                         if let Some(item) = item {
                             report.send(map(item)).unwrap();
