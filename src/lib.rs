@@ -287,8 +287,8 @@ mod tests {
 
     #[test]
     fn basic_map() {
-        let mut par = (0..100).par_map(|x| x*x).collect::<Vec<usize>>();
-        let mut seq = (0..100).map(|x| x*x).collect::<Vec<usize>>();
+        let mut par = (0..1_000_000).par_map(|x| x*x).collect::<Vec<usize>>();
+        let mut seq = (0..1_000_000).map(|x| x*x).collect::<Vec<usize>>();
 
         par.sort();
         seq.sort();
