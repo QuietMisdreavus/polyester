@@ -12,7 +12,8 @@
 extern crate num_cpus;
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Condvar, LockResult, mpsc};
+use std::sync::{Arc, Mutex, Condvar, LockResult, TryLockResult, mpsc};
+use std::sync::TryLockError::Poisoned;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
@@ -271,10 +272,26 @@ impl<T> Hopper<T> {
     fn get_item(&self, id: usize) -> Option<T> {
         let mut queue = guts(self.cache[id].lock());
         loop {
-            //TODO: work-stealing
             if let Some(item) = queue.pop_front() {
                 return Some(item);
-            } else if self.ready.load(SeqCst) {
+            }
+
+            let mut current_id = id;
+
+            loop {
+                current_id = (current_id + 1) % self.cache.len();
+
+                if current_id == id { break; }
+
+                //we still have our lock, so it's possible that other threads still have theirs
+                if let Some(mut other_queue) = try_guts(self.cache[current_id].try_lock()) {
+                    if let Some(item) = other_queue.pop_front() {
+                        return Some(item);
+                    }
+                }
+            }
+
+            if self.ready.load(SeqCst) {
                 return None;
             }
 
@@ -283,20 +300,32 @@ impl<T> Hopper<T> {
     }
 }
 
-///Unwrap a LockResult to get the MutexGuard even when poisonsed.
+/// Unwrap a LockResult to get the MutexGuard even when poisoned.
 ///
-///I don't anticipate ever poisoning my mutexes, but the alternative of just using unwrap gives me
-///the creeps, so here we are.
+/// The only situation where i could see the Hopper mutexes panicing is when one of the queues
+/// overfloes a `usize`. If that's happening, we've got much bigger problems on our hands, so
+/// dropping a few items is the least of our troubles.
 ///
-///Source for the name: http://bulbapedia.bulbagarden.net/wiki/Guts_(Ability)
+/// Source for the name: http://bulbapedia.bulbagarden.net/wiki/Guts_(Ability)
 ///
-///Note that this is literally copy/pasted from synchronoise, where the name makes slightly more
-///sense.
+/// Note that this is literally copy/pasted from synchronoise, where the name makes slightly more
+/// sense.
 pub fn guts<T>(res: LockResult<T>) -> T {
     match res {
         Ok(guard) => guard,
         //The Pokemon's Guts raises its Attack!
         Err(poison) => poison.into_inner(),
+    }
+}
+
+/// Like `guts`, but for `TryLockResult` instead. This version will ignore poison, but still report
+/// `WouldBlock` errors by returning `None`.
+pub fn try_guts<T>(res: TryLockResult<T>) -> Option<T> {
+    match res {
+        Ok(guard) => Some(guard),
+        //The Pokemon's Guts raises its Attack!
+        Err(Poisoned(poison)) => Some(poison.into_inner()),
+        _ => None,
     }
 }
 
