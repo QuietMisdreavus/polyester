@@ -11,91 +11,6 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
 use std::thread;
 
-/// A distributed cache of an iterator's items, meant to be filled by a background thread so that
-/// worker threads can pull from a per-thread cache.
-struct Hopper<T> {
-    /// The cache of items, broken down into per-thread sub-caches.
-    cache: Vec<Mutex<VecDeque<T>>>,
-    /// A set of associated `Condvar`s for worker threads to wait on while the background thread
-    /// adds more items to its cache.
-    signals: Vec<Condvar>,
-    /// A signal that tells whether or not the source iterator has been exhausted.
-    ready: AtomicBool,
-}
-
-impl<T> Hopper<T> {
-    /// Creates a new `Hopper` from the given iterator, with the given number of slots, and begins
-    /// the background cache-filler worker.
-    fn new<I>(iter: I, slots: usize) -> Arc<Hopper<T>>
-    where
-        I: Iterator<Item=T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let mut cache = Vec::with_capacity(slots);
-        let mut signals = Vec::<Condvar>::with_capacity(slots);
-
-        for _ in 0..slots {
-            cache.push(Mutex::new(VecDeque::new()));
-            signals.push(Condvar::new());
-        }
-
-        let ret = Arc::new(Hopper {
-            cache,
-            signals,
-            ready: AtomicBool::new(false),
-        });
-
-        let hopper = ret.clone();
-
-        thread::spawn(move || {
-            let hopper = hopper;
-            let mut current_slot = 0;
-            let mut rounds = 0usize;
-
-            for item in iter {
-                {
-                    let mut queue = guts(hopper.cache[current_slot].lock());
-                    queue.push_back(item);
-                }
-
-                current_slot = (current_slot + 1) % slots;
-
-                if current_slot == 0 {
-                    rounds += 1;
-                }
-
-                if (rounds % (slots * 2)) == 0 {
-                    hopper.signals[current_slot].notify_all();
-                }
-            }
-
-            hopper.ready.store(true, SeqCst);
-
-            for signal in &hopper.signals {
-                signal.notify_all();
-            }
-        });
-
-        ret
-    }
-
-    /// Loads an item from the given cache slot, potentially blocking while the cache-filler worker
-    /// adds more items.
-    fn get_item(&self, id: usize) -> Option<T> {
-        let mut queue = guts(self.cache[id].lock());
-        loop {
-            //TODO: work-stealing
-            if let Some(item) = queue.pop_front() {
-                return Some(item);
-            } else if self.ready.load(SeqCst) {
-                return None;
-            }
-
-            queue = guts(self.signals[id].wait(queue));
-        }
-    }
-}
-
 /// A trait to extend `Iterator`s with consumers that work in parallel.
 pub trait Polyester<T>
 {
@@ -266,6 +181,91 @@ where
         }
 
         self.recv.as_mut().and_then(|r| r.next())
+    }
+}
+
+/// A distributed cache of an iterator's items, meant to be filled by a background thread so that
+/// worker threads can pull from a per-thread cache.
+struct Hopper<T> {
+    /// The cache of items, broken down into per-thread sub-caches.
+    cache: Vec<Mutex<VecDeque<T>>>,
+    /// A set of associated `Condvar`s for worker threads to wait on while the background thread
+    /// adds more items to its cache.
+    signals: Vec<Condvar>,
+    /// A signal that tells whether or not the source iterator has been exhausted.
+    ready: AtomicBool,
+}
+
+impl<T> Hopper<T> {
+    /// Creates a new `Hopper` from the given iterator, with the given number of slots, and begins
+    /// the background cache-filler worker.
+    fn new<I>(iter: I, slots: usize) -> Arc<Hopper<T>>
+    where
+        I: Iterator<Item=T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut cache = Vec::with_capacity(slots);
+        let mut signals = Vec::<Condvar>::with_capacity(slots);
+
+        for _ in 0..slots {
+            cache.push(Mutex::new(VecDeque::new()));
+            signals.push(Condvar::new());
+        }
+
+        let ret = Arc::new(Hopper {
+            cache,
+            signals,
+            ready: AtomicBool::new(false),
+        });
+
+        let hopper = ret.clone();
+
+        thread::spawn(move || {
+            let hopper = hopper;
+            let mut current_slot = 0;
+            let mut rounds = 0usize;
+
+            for item in iter {
+                {
+                    let mut queue = guts(hopper.cache[current_slot].lock());
+                    queue.push_back(item);
+                }
+
+                current_slot = (current_slot + 1) % slots;
+
+                if current_slot == 0 {
+                    rounds += 1;
+                }
+
+                if (rounds % (slots * 2)) == 0 {
+                    hopper.signals[current_slot].notify_all();
+                }
+            }
+
+            hopper.ready.store(true, SeqCst);
+
+            for signal in &hopper.signals {
+                signal.notify_all();
+            }
+        });
+
+        ret
+    }
+
+    /// Loads an item from the given cache slot, potentially blocking while the cache-filler worker
+    /// adds more items.
+    fn get_item(&self, id: usize) -> Option<T> {
+        let mut queue = guts(self.cache[id].lock());
+        loop {
+            //TODO: work-stealing
+            if let Some(item) = queue.pop_front() {
+                return Some(item);
+            } else if self.ready.load(SeqCst) {
+                return None;
+            }
+
+            queue = guts(self.signals[id].wait(queue));
+        }
     }
 }
 
