@@ -2,6 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+//! An extension trait to provide `Iterator` adapters that process items in parallel.
+//!
+//! The heart of this crate is the [`Polyester`] trait, which is applied to any `Iterator` where it
+//! and its items are `Send`.
+//!
+//! [`Polyester`]: trait.Polyester.html
+
 extern crate num_cpus;
 
 use std::collections::VecDeque;
@@ -18,10 +25,11 @@ pub trait Polyester<T>
     ///
     /// This method works in two parts:
     ///
-    /// 1. Use a set of threads to fold items individually into an accumulator,
-    ///    whose initial state is a clone of `seed`.
-    /// 2. Once each thread is finished with its own work set, collect each
-    ///    intermediate accumulator into the final accumulator.
+    /// 1. Use a set of threads to fold items individually into a per-thread accumulator using
+    ///    `inner_fold`. Each per-thread accumulator begins with a clone of `seed`.
+    /// 2. Once each thread is finished with its own work set, collect each intermediate
+    ///    accumulator into a final accumulator, starting with the first thread's personal
+    ///    accumulator and folding additional sub-accumulators using `outer_fold`.
     ///
     /// If there are no items in the iterator, `seed` is returned untouched.
     fn par_fold<Acc, InnerFold, OuterFold>(
@@ -135,6 +143,12 @@ where
     }
 }
 
+/// A parallel `map` adapter, which processes items in parallel.
+///
+/// This struct is returned by [`Polyester::par_map`]. See that function's documentation for more
+/// details.
+///
+/// [`Polyester::par_map`]: trait.Polyester.html#method.par_map
 pub struct ParMap<Iter, Map, T>
 {
     iter: Option<Iter>,
