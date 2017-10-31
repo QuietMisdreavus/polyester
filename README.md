@@ -31,15 +31,17 @@ threads pick up at the same time.
 There's a major drawback to this approach, though: If the worker threads are not expected to be
 performing a lot of per-item work, this will always be slower than just doing it sequentially.
 Therefore, the current version of `polyester` is only recommended if you need to perform intensive
-(or erratically intensive) work per item, or cannot afford to collect the iterator beforehand (to
-just work sequentially, or to hand off to `rayon` instead).
+(or erratically intensive) work per item, or cannot afford to work sequentially or collect the
+iterator beforehand (to hand off to `rayon` instead). Note that if you have an expensive
+*sequential* operation in the iterator before you hand it off to `polyester`, that will impact how
+fast the cache-filler can generate items.
 
 Anyway, once this "hopper" is prepared, handles to it are given to a number of worker threads, so
 that they can run user-supplied closures on the items. Each thread has its own queue to load items
 from, and if its own queue is empty it will begin walking forward through other thread's queues to
-attempt to load more items before waiting. Each queue has an associated `Condvar` which the
-cache-loader worker will signal periodically while filling items or once the iterator has been
-exhausted.
+attempt to load more items before waiting. Each queue has an associated `SignalEvent` (from
+`synchronoise`) which the cache-loader worker will signal periodically while filling items or once
+the iterator has been exhausted.
 
 From here, each adaptor has its own processing:
 
