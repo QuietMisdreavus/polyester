@@ -233,7 +233,7 @@ impl<T> Hopper<T> {
             cache.push(stealer);
             //start the SignalEvents as "ready" in case the filler thread gets a heard start on the
             //workers
-            signals.push(SignalEvent::new(true, SignalKind::Manual));
+            signals.push(SignalEvent::new(true, SignalKind::Auto));
         }
 
         let ret = Arc::new(Hopper {
@@ -286,9 +286,6 @@ impl<T> Hopper<T> {
                 return Some(item);
             }
 
-            //our cache is out of items, so toggle the signal off
-            self.signals[id].reset();
-
             //...but before we sleep, go check the other caches to see if they still have anything
             let mut current_id = id;
             loop {
@@ -300,13 +297,17 @@ impl<T> Hopper<T> {
                 }
             }
 
-            //as a final check, see whether the filler thread is finished
-            if self.done.load(SeqCst) {
-                return None;
-            }
+            //double-check the cache-length before blocking, in case the filler got to ours in the
+            //meantime
+            if self.cache[id].len() == 0 {
+                //as a final check, see whether the filler thread is finished
+                if self.done.load(SeqCst) {
+                    return None;
+                }
 
-            //finally, wait on more items
-            self.signals[id].wait();
+                //otherwise, wait for the cache-filler to get more items
+                self.signals[id].wait();
+            }
         }
     }
 }
