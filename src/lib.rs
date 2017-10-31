@@ -10,14 +10,17 @@
 //! [`Polyester`]: trait.Polyester.html
 
 extern crate num_cpus;
+extern crate coco;
+extern crate synchronoise;
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Condvar, LockResult, TryLockResult, mpsc};
-use std::sync::TryLockError::Poisoned;
+use std::sync::{Arc, mpsc};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
 use std::thread;
+
+use coco::deque;
+use synchronoise::{SignalEvent, SignalKind};
 
 /// A trait to extend `Iterator`s with consumers that work in parallel.
 pub trait Polyester<T>
@@ -203,12 +206,12 @@ where
 /// worker threads can pull from a per-thread cache.
 struct Hopper<T> {
     /// The cache of items, broken down into per-thread sub-caches.
-    cache: Vec<Mutex<VecDeque<T>>>,
+    cache: Vec<deque::Stealer<T>>,
     /// A set of associated `Condvar`s for worker threads to wait on while the background thread
     /// adds more items to its cache.
-    signals: Vec<Condvar>,
+    signals: Vec<SignalEvent>,
     /// A signal that tells whether or not the source iterator has been exhausted.
-    ready: AtomicBool,
+    done: AtomicBool,
 }
 
 impl<T> Hopper<T> {
@@ -219,48 +222,55 @@ impl<T> Hopper<T> {
         I: Iterator<Item=T> + Send + 'static,
         T: Send + 'static,
     {
+        //the fillers go into the filler thread, the cache and signals go into the final hopper
+        let mut fillers = Vec::with_capacity(slots);
         let mut cache = Vec::with_capacity(slots);
-        let mut signals = Vec::<Condvar>::with_capacity(slots);
+        let mut signals = Vec::<SignalEvent>::with_capacity(slots);
 
         for _ in 0..slots {
-            cache.push(Mutex::new(VecDeque::new()));
-            signals.push(Condvar::new());
+            let (filler, stealer) = deque::new();
+            fillers.push(filler);
+            cache.push(stealer);
+            //start the SignalEvents as "ready" in case the filler thread gets a heard start on the
+            //workers
+            signals.push(SignalEvent::new(true, SignalKind::Manual));
         }
 
         let ret = Arc::new(Hopper {
             cache,
             signals,
-            ready: AtomicBool::new(false),
+            done: AtomicBool::new(false),
         });
 
         let hopper = ret.clone();
 
         thread::spawn(move || {
             let hopper = hopper;
+            let fillers = fillers;
             let mut current_slot = 0;
             let mut rounds = 0usize;
 
             for item in iter {
-                {
-                    let mut queue = guts(hopper.cache[current_slot].lock());
-                    queue.push_back(item);
-                }
+                fillers[current_slot].push(item);
 
                 current_slot = (current_slot + 1) % slots;
-
                 if current_slot == 0 {
                     rounds += 1;
                 }
 
+                //every time we've added (slots * 2) items to each slot, wake up all the threads if
+                //they're waiting on more items
                 if (rounds % (slots * 2)) == 0 {
-                    hopper.signals[current_slot].notify_all();
+                    hopper.signals[current_slot].signal();
                 }
             }
 
-            hopper.ready.store(true, SeqCst);
+            //we're out of items, so tell all the workers that we're done
+            hopper.done.store(true, SeqCst);
 
+            //...and wake them up so they can react to the "done" signal
             for signal in &hopper.signals {
-                signal.notify_all();
+                signal.signal();
             }
         });
 
@@ -270,62 +280,34 @@ impl<T> Hopper<T> {
     /// Loads an item from the given cache slot, potentially blocking while the cache-filler worker
     /// adds more items.
     fn get_item(&self, id: usize) -> Option<T> {
-        let mut queue = guts(self.cache[id].lock());
         loop {
-            if let Some(item) = queue.pop_front() {
+            //go pull from our cache to see if we have anything
+            if let Some(item) = self.cache[id].steal() {
                 return Some(item);
             }
 
-            let mut current_id = id;
+            //our cache is out of items, so toggle the signal off
+            self.signals[id].reset();
 
+            //...but before we sleep, go check the other caches to see if they still have anything
+            let mut current_id = id;
             loop {
                 current_id = (current_id + 1) % self.cache.len();
-
                 if current_id == id { break; }
 
-                //we still have our lock, so it's possible that other threads still have theirs
-                if let Some(mut other_queue) = try_guts(self.cache[current_id].try_lock()) {
-                    if let Some(item) = other_queue.pop_front() {
-                        return Some(item);
-                    }
+                if let Some(item) = self.cache[current_id].steal() {
+                    return Some(item);
                 }
             }
 
-            if self.ready.load(SeqCst) {
+            //as a final check, see whether the filler thread is finished
+            if self.done.load(SeqCst) {
                 return None;
             }
 
-            queue = guts(self.signals[id].wait(queue));
+            //finally, wait on more items
+            self.signals[id].wait();
         }
-    }
-}
-
-/// Unwrap a LockResult to get the MutexGuard even when poisoned.
-///
-/// The only situation where i could see the Hopper mutexes panicing is when one of the queues
-/// overfloes a `usize`. If that's happening, we've got much bigger problems on our hands, so
-/// dropping a few items is the least of our troubles.
-///
-/// Source for the name: http://bulbapedia.bulbagarden.net/wiki/Guts_(Ability)
-///
-/// Note that this is literally copy/pasted from synchronoise, where the name makes slightly more
-/// sense.
-pub fn guts<T>(res: LockResult<T>) -> T {
-    match res {
-        Ok(guard) => guard,
-        //The Pokemon's Guts raises its Attack!
-        Err(poison) => poison.into_inner(),
-    }
-}
-
-/// Like `guts`, but for `TryLockResult` instead. This version will ignore poison, but still report
-/// `WouldBlock` errors by returning `None`.
-pub fn try_guts<T>(res: TryLockResult<T>) -> Option<T> {
-    match res {
-        Ok(guard) => Some(guard),
-        //The Pokemon's Guts raises its Attack!
-        Err(Poisoned(poison)) => Some(poison.into_inner()),
-        _ => None,
     }
 }
 
