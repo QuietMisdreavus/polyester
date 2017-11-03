@@ -14,7 +14,7 @@ extern crate coco;
 extern crate synchronoise;
 
 use std::sync::{Arc, mpsc};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
 use std::thread;
@@ -81,7 +81,7 @@ where
         InnerFold: Fn(Acc, T) -> Acc + Send + Sync + 'static,
         OuterFold: Fn(Acc, Acc) -> Acc
     {
-        let num_jobs = num_cpus::get();
+        let num_jobs = get_thread_count();
 
         if num_jobs == 1 {
             //it's not worth collecting the items into the hopper and spawning a thread if it's
@@ -171,7 +171,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if let (Some(iter), Some(map)) = (self.iter.take(), self.map.take()) {
-            let num_jobs = num_cpus::get();
+            let num_jobs = get_thread_count();
 
             let hopper = Hopper::new(iter, num_jobs);
             let map = Arc::new(map);
@@ -309,6 +309,32 @@ impl<T> Hopper<T> {
                 self.signals[id].wait();
             }
         }
+    }
+}
+
+static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
+
+/// Sets the number of threads started by the [`Polyester`] adapters.
+///
+/// [`Polyester`]: trait.Polyester.html
+///
+/// This sets an atomic counter accessed by the [`Polyester`] adaptors to calculate how many worker
+/// threads to start. Note that one extra thread will always be spawned, to handle the iterator
+/// item dispatch.
+///
+/// If this is set to zero (or never set in the first place), the adapters will spawn as many
+/// threads as the number of cores on the current system.
+pub fn set_thread_count(count: usize) {
+    THREAD_COUNT.store(count, SeqCst);
+}
+
+fn get_thread_count() -> usize {
+    let count = THREAD_COUNT.load(SeqCst);
+
+    if count == 0 {
+        num_cpus::get()
+    } else {
+        count
     }
 }
 
