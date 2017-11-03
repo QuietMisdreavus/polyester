@@ -4,10 +4,12 @@
 
 //! An extension trait to provide `Iterator` adapters that process items in parallel.
 //!
-//! The heart of this crate is the [`Polyester`] trait, which is applied to any `Iterator` where it
-//! and its items are `Send`.
+//! The heart of this crate (and what should be considered its entry point) is the [`Polyester`]
+//! trait, which is applied to any `Iterator` where it and its items are `Send`.
 //!
 //! [`Polyester`]: trait.Polyester.html
+
+#![doc(test(attr(allow(unused_variables))))]
 
 extern crate num_cpus;
 extern crate coco;
@@ -23,19 +25,57 @@ use coco::deque;
 use synchronoise::{SignalEvent, SignalKind};
 
 /// A trait to extend `Iterator`s with consumers that work in parallel.
+///
+/// This trait is applied to any iterator where it and its items are `Send`, allowing them to be
+/// processed by multiple threads. Importing the trait into your code allows these adaptors to be
+/// used like any other iterator adaptor - the only difference is that between the time they're
+/// started and when they finish, they'll have spawned a number of threads to perform their work.
+///
+/// # Implementation Note
+///
+/// It's worth noting that even though this promises parallel processing, that's no guarantee that
+/// it will be faster than just doing it sequentially. The iterator itself is a bottleneck for the
+/// processing, since it needs an exclusive `&mut self` borrow to get each item. This library
+/// attempts to get around that by draining the items in a separate thread into a cache that the
+/// workers load from, but the synchronization costs for this mean that switching `map` for
+/// `par_map` (for example) is not a universal win. Because of this, these adapters are only
+/// expected to speed up processing if your source iterator is rather quick, and the closures you
+/// hand to the adapters are not.
 pub trait Polyester<T>
 {
     /// Fold the iterator in parallel.
     ///
     /// This method works in two parts:
     ///
-    /// 1. Use a set of threads to fold items individually into a per-thread accumulator using
-    ///    `inner_fold`. Each per-thread accumulator begins with a clone of `seed`.
-    /// 2. Once each thread is finished with its own work set, collect each intermediate
-    ///    accumulator into a final accumulator, starting with the first thread's personal
-    ///    accumulator and folding additional sub-accumulators using `outer_fold`.
+    /// 1. Use a set of threads to fold items individually into a per-thread "sub-accumulator"
+    ///    using `inner_fold`. Each per-thread sub-accumulator begins with a clone of `seed`.
+    /// 2. Once the source iterator is exhausted and has no more items, collect each intermediate
+    ///    sub-accumulator into a final accumulator, starting with the first thread's personal
+    ///    sub-accumulator and folding additional sub-accumulators using `outer_fold`.
     ///
     /// If there are no items in the iterator, `seed` is returned untouched.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polyester::Polyester;
+    /// # fn some_expensive_computation(it: usize) -> usize {
+    /// #     if it == 7 { std::thread::sleep(std::time::Duration::from_secs(1)); }
+    /// #     it
+    /// # }
+    ///
+    /// let my_results = (0..1_000_000).par_fold(
+    ///     vec![],
+    ///     |mut acc, it| {
+    ///         acc.push(some_expensive_computation(it));
+    ///         acc
+    ///     },
+    ///     |mut left, right| {
+    ///         left.extend(right);
+    ///         left
+    ///     }
+    /// );
+    /// ```
     fn par_fold<Acc, InnerFold, OuterFold>(
         self,
         seed: Acc,
@@ -43,24 +83,36 @@ pub trait Polyester<T>
         outer_fold: OuterFold,
     ) -> Acc
     where
-        T: Send + 'static,
         Acc: Clone + Send + 'static,
         InnerFold: Fn(Acc, T) -> Acc + Send + Sync + 'static,
         OuterFold: Fn(Acc, Acc) -> Acc;
 
     /// Maps the given closure onto each element in the iterator, in parallel.
     ///
-    /// This method will dispatch the items of this iterator into a thread pool. Each thread will
-    /// take items from the iterator and run the given closure, yielding them back out as they are
-    /// processed. Note that this means that the ordering of items of the result is not guaranteed
-    /// to be the same as the order of items from the source iterator.
+    /// The `ParMap` adaptor returned by this function starts up a thread pool to run `map` on each
+    /// item of the iterator. The result of each `map` is then passed back to the calling thread,
+    /// where it can then be returned by `ParMap`'s `Iterator` implementation. Note that `ParMap`
+    /// will yield items in the order the *threads* return them, which may not be the same as the
+    /// order the *source iterator* does.
     ///
     /// The `ParMap` adaptor does not start its thread pool until it is first polled, after which
     /// it will block for the next item until the iterator is exhausted.
-    fn par_map<Map, Out>(self, Map) -> ParMap<Self, Map, Out>
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polyester::Polyester;
+    /// # fn some_expensive_computation(it: usize) -> usize {
+    /// #     if it == 7 { std::thread::sleep(std::time::Duration::from_secs(1)); }
+    /// #     it
+    /// # }
+    ///
+    /// let my_results = (0..1_000_000).par_map(|it| some_expensive_computation(it))
+    ///                                .collect::<Vec<_>>();
+    /// ```
+    fn par_map<Map, Out>(self, map: Map) -> ParMap<Self, Map, Out>
     where
         Self: Sized,
-        T: Send + 'static,
         Map: Fn(T) -> Out + Send + Sync + 'static,
         Out: Send + 'static;
 }
@@ -68,6 +120,7 @@ pub trait Polyester<T>
 impl<T, I> Polyester<T> for I
 where
     I: Iterator<Item=T> + Send + 'static,
+    T: Send + 'static,
 {
     fn par_fold<Acc, InnerFold, OuterFold>(
         self,
@@ -147,7 +200,7 @@ where
     }
 }
 
-/// A parallel `map` adapter, which processes items in parallel.
+/// A parallel `map` adapter, which uses multiple threads to process items.
 ///
 /// This struct is returned by [`Polyester::par_map`]. See that function's documentation for more
 /// details.
@@ -237,8 +290,8 @@ impl<T> Hopper<T> {
         }
 
         let ret = Arc::new(Hopper {
-            cache,
-            signals,
+            cache: cache,
+            signals: signals,
             done: AtomicBool::new(false),
         });
 
@@ -314,7 +367,7 @@ impl<T> Hopper<T> {
 
 static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
-/// Sets the number of threads started by the [`Polyester`] adapters.
+/// Sets the number of threads started by the [`Polyester`] adaptors.
 ///
 /// [`Polyester`]: trait.Polyester.html
 ///
