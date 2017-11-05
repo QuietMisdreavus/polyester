@@ -2,6 +2,11 @@
 name = "polyester"
 version = "0.1.0"
 authors = ["QuietMisdreavus <grey@quietmisdreavus.net>"]
+description = "Parallel iterator adaptors that accept arbitrary iterators"
+documentation = "https://docs.rs/polyester"
+repository = "https://github.com/QuietMisdreavus/polyester"
+categories = ["concurrency", "rust-patterns"]
+keywords = ["iterators", "parallel"]
 license = "MPL-2.0"
 readme = "README.md"
 

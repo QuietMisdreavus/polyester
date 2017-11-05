@@ -10,11 +10,26 @@ This work-in-progress library features an extenstion trait, `Polyester`, that ex
 provides some parallel operations that allow you to spread consumption of the iterator across
 multiple threads.
 
+To use this crate in your own project, add the following to your Cargo.toml:
+
+```toml
+[dependencies]
+polyester = "0.1.0"
+```
+
+...and the following to your crate root:
+
+```rust
+extern crate polyester;
+
+use polyester::Polyester;
+```
+
 ## but wait, isn't that what `rayon` does?
 
 Not quite. `rayon` is built on creating adaptors that fit its own `ParallelIterator` trait, which
 can only be created from fixed-length collections. `polyester` wants to work from arbitrary
-`Iterators` and provide arbitrary `Iterator`s back (or consume them and provide some appropriate
+`Iterator`s and provide arbitrary `Iterator`s back (or consume them and provide some appropriate
 output). Basically, it's purely an extension trait for anything that already implements `Iterator`.
 This means that there are distinct design goals for `polyester` that give it different performance
 characteristics from `rayon`.
