@@ -411,8 +411,8 @@ mod tests {
         let par_dur = secs_millis(after_par.duration_since(before));
         let seq_dur = secs_millis(after_seq.duration_since(after_par));
         println!("");
-        println!("    parallel fold:   {}.{:04}s", par_dur.0, par_dur.1);
-        println!("    sequential fold: {}.{:04}s", seq_dur.0, seq_dur.1);
+        println!("    parallel fold:   {}.{:03}s", par_dur.0, par_dur.1);
+        println!("    sequential fold: {}.{:03}s", seq_dur.0, seq_dur.1);
 
         assert_eq!(par, seq);
     }
@@ -431,8 +431,8 @@ mod tests {
         let par_dur = secs_millis(after_par.duration_since(before));
         let seq_dur = secs_millis(after_seq.duration_since(after_par));
         println!("");
-        println!("    parallel map:   {}.{:04}s", par_dur.0, par_dur.1);
-        println!("    sequential map: {}.{:04}s", seq_dur.0, seq_dur.1);
+        println!("    parallel map:   {}.{:03}s", par_dur.0, par_dur.1);
+        println!("    sequential map: {}.{:03}s", seq_dur.0, seq_dur.1);
 
         assert_eq!(par, seq);
     }
