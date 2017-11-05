@@ -7,7 +7,7 @@ some parallel iterator adapters for rust
 [Documentation]: https://docs.rs/polyester
 [doc-dev]: https://tonberry.quietmisdreavus.net/polyester-dev/polyester/
 
-This work-in-progress library features an extenstion trait, `Polyester`, that extends `Iterator` and
+This work-in-progress library features an extension trait, `Polyester`, that extends `Iterator` and
 provides some parallel operations that allow you to spread consumption of the iterator across
 multiple threads.
 
