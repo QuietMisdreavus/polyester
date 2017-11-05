@@ -5,6 +5,10 @@ authors = ["QuietMisdreavus <grey@quietmisdreavus.net>"]
 license = "MPL-2.0"
 readme = "README.md"
 
+[badges]
+travis-ci = { repository = "QuietMisdreavus/polyester" }
+appveyor = { repository = "QuietMisdreavus/polyester" }
+
 [dependencies]
 num_cpus = "1"
 synchronoise = "0.4.0"
