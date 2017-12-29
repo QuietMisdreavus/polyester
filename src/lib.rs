@@ -83,8 +83,8 @@ pub trait Polyester<T>
         outer_fold: OuterFold,
     ) -> Acc
     where
-        Acc: Clone + Send + 'static,
-        InnerFold: Fn(Acc, T) -> Acc + Send + Sync + 'static,
+        Acc: Clone + Send,
+        InnerFold: Fn(Acc, T) -> Acc + Send + Sync,
         OuterFold: Fn(Acc, Acc) -> Acc;
 
     /// Maps the given closure onto each element in the iterator, in parallel.
@@ -113,14 +113,15 @@ pub trait Polyester<T>
     fn par_map<Map, Out>(self, map: Map) -> ParMap<Self, Map, Out>
     where
         Self: Sized,
+        T: Send + 'static,
         Map: Fn(T) -> Out + Send + Sync + 'static,
         Out: Send + 'static;
 }
 
 impl<T, I> Polyester<T> for I
 where
-    I: Iterator<Item=T> + Send + 'static,
-    T: Send + 'static,
+    I: Iterator<Item=T> + Send,
+    T: Send,
 {
     fn par_fold<Acc, InnerFold, OuterFold>(
         self,
@@ -129,60 +130,61 @@ where
         outer_fold: OuterFold,
     ) -> Acc
     where
-        T: Send + 'static,
-        Acc: Clone + Send + 'static,
-        InnerFold: Fn(Acc, T) -> Acc + Send + Sync + 'static,
+        Acc: Clone + Send,
+        InnerFold: Fn(Acc, T) -> Acc + Send + Sync,
         OuterFold: Fn(Acc, Acc) -> Acc
     {
-        let num_jobs = get_thread_count();
+        crossbeam::scope(|scope| {
+            let num_jobs = get_thread_count();
 
-        if num_jobs == 1 {
-            //it's not worth collecting the items into the hopper and spawning a thread if it's
-            //still going to be serial, just fold it inline
-            return self.fold(seed, inner_fold);
-        }
-
-        let hopper = Hopper::new(self, num_jobs);
-        let inner_fold = Arc::new(inner_fold);
-        let (report, recv) = channel();
-
-        //launch the workers
-        for id in 0..num_jobs {
-            let hopper = hopper.clone();
-            let acc = seed.clone();
-            let inner_fold = inner_fold.clone();
-            let report = report.clone();
-            std::thread::spawn(move || {
-                let mut acc = acc;
-
-                loop {
-                    let item = hopper.get_item(id);
-
-                    if let Some(item) = item {
-                        acc = inner_fold(acc, item);
-                    } else {
-                        break;
-                    }
-                }
-
-                report.send(acc).unwrap();
-            });
-        }
-
-        //hang up our initial channel so we don't wait for a response from it
-        drop(report);
-
-        //collect and fold the workers' results
-        let mut acc: Option<Acc> = None;
-        for res in recv.iter() {
-            if acc.is_none() {
-                acc = Some(res);
-            } else {
-                acc = acc.map(|acc| outer_fold(acc, res));
+            if num_jobs == 1 {
+                //it's not worth collecting the items into the hopper and spawning a thread if it's
+                //still going to be serial, just fold it inline
+                return self.fold(seed, inner_fold);
             }
-        }
 
-        acc.unwrap_or(seed)
+            let hopper = Hopper::new_scoped(self, num_jobs, scope);
+            let inner_fold = Arc::new(inner_fold);
+            let (report, recv) = channel();
+
+            //launch the workers
+            for id in 0..num_jobs {
+                let hopper = hopper.clone();
+                let acc = seed.clone();
+                let inner_fold = inner_fold.clone();
+                let report = report.clone();
+                scope.spawn(move || {
+                    let mut acc = acc;
+
+                    loop {
+                        let item = hopper.get_item(id);
+
+                        if let Some(item) = item {
+                            acc = inner_fold(acc, item);
+                        } else {
+                            break;
+                        }
+                    }
+
+                    report.send(acc).unwrap();
+                });
+            }
+
+            //hang up our initial channel so we don't wait for a response from it
+            drop(report);
+
+            //collect and fold the workers' results
+            let mut acc: Option<Acc> = None;
+            for res in recv.iter() {
+                if acc.is_none() {
+                    acc = Some(res);
+                } else {
+                    acc = acc.map(|acc| outer_fold(acc, res));
+                }
+            }
+
+            acc.unwrap_or(seed)
+        })
     }
 
     fn par_map<Map, Out>(self, map: Map) -> ParMap<I, Map, Out>
@@ -268,6 +270,68 @@ struct Hopper<T> {
 }
 
 impl<T> Hopper<T> {
+    /// Creates a new `Hopper` from the given iterator, with the given number of slots, and begins
+    /// the background cache-filler worker.
+    fn new_scoped<'a, I>(iter: I, slots: usize, scope: &crossbeam::Scope<'a>) -> Arc<Hopper<T>>
+    where
+        I: Iterator<Item=T> + Send + 'a,
+        T: Send + 'a,
+    {
+        //the fillers go into the filler thread, the cache and signals go into the final hopper
+        let mut fillers = Vec::with_capacity(slots);
+        let mut cache = Vec::with_capacity(slots);
+        let mut signals = Vec::<SignalEvent>::with_capacity(slots);
+
+        for _ in 0..slots {
+            let (filler, stealer) = chase_lev::deque();
+            fillers.push(filler);
+            cache.push(stealer);
+            //start the SignalEvents as "ready" in case the filler thread gets a heard start on the
+            //workers
+            signals.push(SignalEvent::new(true, SignalKind::Auto));
+        }
+
+        let ret = Arc::new(Hopper {
+            cache: cache,
+            signals: signals,
+            done: AtomicBool::new(false),
+        });
+
+        let hopper = ret.clone();
+
+        scope.spawn(move || {
+            let hopper = hopper;
+            let fillers = fillers;
+            let mut current_slot = 0;
+            let mut rounds = 0usize;
+
+            for item in iter {
+                fillers[current_slot].push(item);
+
+                current_slot = (current_slot + 1) % slots;
+                if current_slot == 0 {
+                    rounds += 1;
+                }
+
+                //every time we've added (slots * 2) items to each slot, wake up all the threads if
+                //they're waiting on more items
+                if (rounds % (slots * 2)) == 0 {
+                    hopper.signals[current_slot].signal();
+                }
+            }
+
+            //we're out of items, so tell all the workers that we're done
+            hopper.done.store(true, SeqCst);
+
+            //...and wake them up so they can react to the "done" signal
+            for signal in &hopper.signals {
+                signal.signal();
+            }
+        });
+
+        ret
+    }
+
     /// Creates a new `Hopper` from the given iterator, with the given number of slots, and begins
     /// the background cache-filler worker.
     fn new<I>(iter: I, slots: usize) -> Arc<Hopper<T>>
