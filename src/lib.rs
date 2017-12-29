@@ -12,7 +12,7 @@
 #![doc(test(attr(allow(unused_variables))))]
 
 extern crate num_cpus;
-extern crate coco;
+extern crate crossbeam;
 extern crate synchronoise;
 
 use std::sync::{Arc, mpsc};
@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
 use std::thread;
 
-use coco::deque;
+use crossbeam::sync::chase_lev;
 use synchronoise::{SignalEvent, SignalKind};
 
 /// A trait to extend `Iterator`s with consumers that work in parallel.
@@ -259,7 +259,7 @@ where
 /// worker threads can pull from a per-thread cache.
 struct Hopper<T> {
     /// The cache of items, broken down into per-thread sub-caches.
-    cache: Vec<deque::Stealer<T>>,
+    cache: Vec<chase_lev::Stealer<T>>,
     /// A set of associated `Condvar`s for worker threads to wait on while the background thread
     /// adds more items to its cache.
     signals: Vec<SignalEvent>,
@@ -281,7 +281,7 @@ impl<T> Hopper<T> {
         let mut signals = Vec::<SignalEvent>::with_capacity(slots);
 
         for _ in 0..slots {
-            let (filler, stealer) = deque::new();
+            let (filler, stealer) = chase_lev::deque();
             fillers.push(filler);
             cache.push(stealer);
             //start the SignalEvents as "ready" in case the filler thread gets a heard start on the
@@ -330,12 +330,23 @@ impl<T> Hopper<T> {
         ret
     }
 
+    /// Attempts to steal an item from a single queue.
+    fn steal(&self, id: usize) -> Option<T> {
+        loop {
+            match self.cache[id].steal() {
+                chase_lev::Steal::Empty => return None,
+                chase_lev::Steal::Data(it) => return Some(it),
+                chase_lev::Steal::Abort => (),
+            }
+        }
+    }
+
     /// Loads an item from the given cache slot, potentially blocking while the cache-filler worker
     /// adds more items.
     fn get_item(&self, id: usize) -> Option<T> {
         loop {
             //go pull from our cache to see if we have anything
-            if let Some(item) = self.cache[id].steal() {
+            if let Some(item) = self.steal(id) {
                 return Some(item);
             }
 
@@ -345,22 +356,18 @@ impl<T> Hopper<T> {
                 current_id = (current_id + 1) % self.cache.len();
                 if current_id == id { break; }
 
-                if let Some(item) = self.cache[current_id].steal() {
+                if let Some(item) = self.steal(current_id) {
                     return Some(item);
                 }
             }
 
-            //double-check the cache-length before blocking, in case the filler got to ours in the
-            //meantime
-            if self.cache[id].len() == 0 {
-                //as a final check, see whether the filler thread is finished
-                if self.done.load(SeqCst) {
-                    return None;
-                }
-
-                //otherwise, wait for the cache-filler to get more items
-                self.signals[id].wait();
+            //as a final check, see whether the filler thread is finished
+            if self.done.load(SeqCst) {
+                return None;
             }
+
+            //otherwise, wait for the cache-filler to get more items
+            self.signals[id].wait();
         }
     }
 }

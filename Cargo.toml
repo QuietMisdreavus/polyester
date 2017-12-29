@@ -17,4 +17,4 @@ appveyor = { repository = "QuietMisdreavus/polyester" }
 [dependencies]
 num_cpus = "1"
 synchronoise = "0.4.0"
-coco = "0.3.1"
+crossbeam = "0.3.0"
