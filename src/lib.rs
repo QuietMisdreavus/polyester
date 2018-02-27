@@ -17,10 +17,9 @@ extern crate synchronoise;
 extern crate rayon_core;
 
 use std::sync::{Arc, mpsc};
-use std::sync::atomic::{AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
-use std::thread;
 
 use crossbeam_deque::{Deque, Stealer, Steal};
 use synchronoise::{SignalEvent, SignalKind};
@@ -136,7 +135,7 @@ where
         OuterFold: Fn(Acc, Acc) -> Acc
     {
         let res = rayon_core::scope(|scope| {
-            let num_jobs = get_thread_count();
+            let num_jobs = rayon_core::current_num_threads();
 
             if num_jobs == 1 {
                 //it's not worth collecting the items into the hopper and spawning a thread if it's
@@ -231,7 +230,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if let (Some(iter), Some(map)) = (self.iter.take(), self.map.take()) {
-            let num_jobs = get_thread_count();
+            let num_jobs = rayon_core::current_num_threads();
 
             let hopper = Hopper::new(iter, num_jobs);
             let map = Arc::new(map);
@@ -242,7 +241,7 @@ where
                 let hopper = hopper.clone();
                 let report = report.clone();
                 let map = map.clone();
-                std::thread::spawn(move || {
+                rayon_core::spawn(move || {
                     loop {
                         let item = hopper.get_item(id);
 
@@ -368,7 +367,7 @@ impl<T> Hopper<T> {
 
         let hopper = ret.clone();
 
-        thread::spawn(move || {
+        rayon_core::spawn(move || {
             let hopper = hopper;
             let fillers = fillers;
             let mut current_slot = 0;
@@ -440,32 +439,6 @@ impl<T> Hopper<T> {
             //otherwise, wait for the cache-filler to get more items
             self.signals[id].wait();
         }
-    }
-}
-
-static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
-
-/// Sets the number of threads started by the [`Polyester`] adaptors.
-///
-/// [`Polyester`]: trait.Polyester.html
-///
-/// This sets an atomic counter accessed by the [`Polyester`] adaptors to calculate how many worker
-/// threads to start. Note that one extra thread will always be spawned, to handle the iterator
-/// item dispatch.
-///
-/// If this is set to zero (or never set in the first place), the adapters will spawn as many
-/// threads as the number of cores on the current system.
-pub fn set_thread_count(count: usize) {
-    THREAD_COUNT.store(count, SeqCst);
-}
-
-fn get_thread_count() -> usize {
-    let count = THREAD_COUNT.load(SeqCst);
-
-    if count == 0 {
-        num_cpus::get()
-    } else {
-        count
     }
 }
 
