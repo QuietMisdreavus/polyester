@@ -12,7 +12,7 @@
 #![doc(test(attr(allow(unused_variables))))]
 
 extern crate num_cpus;
-extern crate crossbeam;
+extern crate crossbeam_deque;
 extern crate synchronoise;
 extern crate rayon_core;
 
@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
 use std::thread;
 
-use crossbeam::sync::chase_lev;
+use crossbeam_deque::{Deque, Stealer, Steal};
 use synchronoise::{SignalEvent, SignalKind};
 
 /// A trait to extend `Iterator`s with consumers that work in parallel.
@@ -266,7 +266,7 @@ where
 /// worker threads can pull from a per-thread cache.
 struct Hopper<T> {
     /// The cache of items, broken down into per-thread sub-caches.
-    cache: Vec<chase_lev::Stealer<T>>,
+    cache: Vec<Stealer<T>>,
     /// A set of associated `Condvar`s for worker threads to wait on while the background thread
     /// adds more items to its cache.
     signals: Vec<SignalEvent>,
@@ -288,8 +288,9 @@ impl<T> Hopper<T> {
         let mut signals = Vec::<SignalEvent>::with_capacity(slots);
 
         for _ in 0..slots {
-            let (filler, stealer) = chase_lev::deque();
-            fillers.push(filler);
+            let deque = Deque::new();
+            let stealer = deque.stealer();
+            fillers.push(deque);
             cache.push(stealer);
             //start the SignalEvents as "ready" in case the filler thread gets a heard start on the
             //workers
@@ -350,8 +351,9 @@ impl<T> Hopper<T> {
         let mut signals = Vec::<SignalEvent>::with_capacity(slots);
 
         for _ in 0..slots {
-            let (filler, stealer) = chase_lev::deque();
-            fillers.push(filler);
+            let deque = Deque::new();
+            let stealer = deque.stealer();
+            fillers.push(deque);
             cache.push(stealer);
             //start the SignalEvents as "ready" in case the filler thread gets a heard start on the
             //workers
@@ -403,9 +405,9 @@ impl<T> Hopper<T> {
     fn steal(&self, id: usize) -> Option<T> {
         loop {
             match self.cache[id].steal() {
-                chase_lev::Steal::Empty => return None,
-                chase_lev::Steal::Data(it) => return Some(it),
-                chase_lev::Steal::Abort => (),
+                Steal::Empty => return None,
+                Steal::Data(it) => return Some(it),
+                Steal::Retry => (),
             }
         }
     }
