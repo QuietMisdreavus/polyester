@@ -18,3 +18,4 @@ appveyor = { repository = "QuietMisdreavus/polyester" }
 num_cpus = "1"
 synchronoise = "0.4.0"
 crossbeam = "0.3.0"
+rayon-core = "1"

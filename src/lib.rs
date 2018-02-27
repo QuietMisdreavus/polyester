@@ -14,6 +14,7 @@
 extern crate num_cpus;
 extern crate crossbeam;
 extern crate synchronoise;
+extern crate rayon_core;
 
 use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
@@ -134,18 +135,18 @@ where
         InnerFold: Fn(Acc, T) -> Acc + Send + Sync,
         OuterFold: Fn(Acc, Acc) -> Acc
     {
-        crossbeam::scope(|scope| {
+        let res = rayon_core::scope(|scope| {
             let num_jobs = get_thread_count();
 
             if num_jobs == 1 {
                 //it's not worth collecting the items into the hopper and spawning a thread if it's
                 //still going to be serial, just fold it inline
-                return self.fold(seed, inner_fold);
+                return Err(self.fold(seed, inner_fold));
             }
 
             let hopper = Hopper::new_scoped(self, num_jobs, scope);
             let inner_fold = Arc::new(inner_fold);
-            let (report, recv) = channel();
+            let (report, recv) = channel::<Acc>();
 
             //launch the workers
             for id in 0..num_jobs {
@@ -153,7 +154,7 @@ where
                 let acc = seed.clone();
                 let inner_fold = inner_fold.clone();
                 let report = report.clone();
-                scope.spawn(move || {
+                scope.spawn(move |_| {
                     let mut acc = acc;
 
                     loop {
@@ -170,21 +171,25 @@ where
                 });
             }
 
-            //hang up our initial channel so we don't wait for a response from it
-            drop(report);
+            Ok((seed, recv))
+        });
 
-            //collect and fold the workers' results
-            let mut acc: Option<Acc> = None;
-            for res in recv.iter() {
-                if acc.is_none() {
-                    acc = Some(res);
-                } else {
-                    acc = acc.map(|acc| outer_fold(acc, res));
+        let mut acc: Option<Acc> = None;
+        match res {
+            Ok((seed, recv)) => {
+                //collect and fold the workers' results
+                for res in recv.iter() {
+                    if acc.is_none() {
+                        acc = Some(res);
+                    } else {
+                        acc = acc.map(|acc| outer_fold(acc, res));
+                    }
                 }
-            }
 
-            acc.unwrap_or(seed)
-        })
+                acc.unwrap_or(seed)
+            }
+            Err(acc) => acc,
+        }
     }
 
     fn par_map<Map, Out>(self, map: Map) -> ParMap<I, Map, Out>
@@ -272,7 +277,7 @@ struct Hopper<T> {
 impl<T> Hopper<T> {
     /// Creates a new `Hopper` from the given iterator, with the given number of slots, and begins
     /// the background cache-filler worker.
-    fn new_scoped<'a, I>(iter: I, slots: usize, scope: &crossbeam::Scope<'a>) -> Arc<Hopper<T>>
+    fn new_scoped<'a, I>(iter: I, slots: usize, scope: &rayon_core::Scope<'a>) -> Arc<Hopper<T>>
     where
         I: Iterator<Item=T> + Send + 'a,
         T: Send + 'a,
@@ -299,7 +304,7 @@ impl<T> Hopper<T> {
 
         let hopper = ret.clone();
 
-        scope.spawn(move || {
+        scope.spawn(move |_| {
             let hopper = hopper;
             let fillers = fillers;
             let mut current_slot = 0;
