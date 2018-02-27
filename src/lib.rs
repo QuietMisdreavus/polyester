@@ -120,7 +120,7 @@ pub trait Polyester<T>
 
 impl<T, I> Polyester<T> for I
 where
-    I: Iterator<Item=T> + Send,
+    I: IntoIterator<Item=T> + Send,
     T: Send,
 {
     fn par_fold<Acc, InnerFold, OuterFold>(
@@ -140,7 +140,7 @@ where
             if num_jobs == 1 {
                 //it's not worth collecting the items into the hopper and spawning a thread if it's
                 //still going to be serial, just fold it inline
-                return self.fold(seed, inner_fold);
+                return self.into_iter().fold(seed, inner_fold);
             }
 
             let hopper = Hopper::new_scoped(self, num_jobs, scope);
@@ -217,7 +217,7 @@ pub struct ParMap<Iter, Map, T>
 
 impl<Iter, Map, T> Iterator for ParMap<Iter, Map, T>
 where
-    Iter: Iterator + Send + 'static,
+    Iter: IntoIterator + Send + 'static,
     Iter::Item: Send + 'static,
     Map: Fn(Iter::Item) -> T + Send + Sync + 'static,
     T: Send + 'static,
@@ -274,7 +274,7 @@ impl<T> Hopper<T> {
     /// the background cache-filler worker.
     fn new_scoped<'a, I>(iter: I, slots: usize, scope: &crossbeam::Scope<'a>) -> Arc<Hopper<T>>
     where
-        I: Iterator<Item=T> + Send + 'a,
+        I: IntoIterator<Item=T> + Send + 'a,
         T: Send + 'a,
     {
         //the fillers go into the filler thread, the cache and signals go into the final hopper
@@ -336,7 +336,7 @@ impl<T> Hopper<T> {
     /// the background cache-filler worker.
     fn new<I>(iter: I, slots: usize) -> Arc<Hopper<T>>
     where
-        I: Iterator<Item=T> + Send + 'static,
+        I: IntoIterator<Item=T> + Send + 'static,
         T: Send + 'static,
     {
         //the fillers go into the filler thread, the cache and signals go into the final hopper
