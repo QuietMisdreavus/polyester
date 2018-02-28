@@ -4,7 +4,6 @@
 
 //! Connecting traits and types to bridge `Iterator` and `ParallelIterator`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 
 use crossbeam_deque::{Deque, Stealer, Steal};
@@ -52,12 +51,12 @@ impl<Iter: IntoIterator + Send> ParallelIterator for IterParallel<Iter>
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
         where C: UnindexedConsumer<Self::Item>
     {
+        let done = AtomicBool::new(false);
         scope(|s| {
-            let done = Arc::new(AtomicBool::new(false));
             let deque = Deque::new();
             let stealer = deque.stealer();
 
-            let signal = done.clone();
+            let signal = &done;
             s.spawn(move |_| {
                 let mut iter = self.iter.into_iter();
 
@@ -75,9 +74,10 @@ impl<Iter: IntoIterator + Send> ParallelIterator for IterParallel<Iter>
                 signal.store(true, Ordering::SeqCst);
             });
 
+            let split_count = AtomicUsize::new(current_num_threads());
             let result = bridge_unindexed(IterParallelProducer {
-                split_count: Arc::new(AtomicUsize::new(current_num_threads())),
-                done: done.clone(),
+                split_count: &split_count,
+                done: &done,
                 items: stealer,
             }, consumer);
 
@@ -90,24 +90,24 @@ impl<Iter: IntoIterator + Send> ParallelIterator for IterParallel<Iter>
     }
 }
 
-struct IterParallelProducer<T> {
-    split_count: Arc<AtomicUsize>,
-    done: Arc<AtomicBool>,
+struct IterParallelProducer<'a, T> {
+    split_count: &'a AtomicUsize,
+    done: &'a AtomicBool,
     items: Stealer<T>,
 }
 
 // manual clone because T doesn't need to be Clone, but the derive assumes it should be
-impl<T> Clone for IterParallelProducer<T> {
+impl<'a, T> Clone for IterParallelProducer<'a, T> {
     fn clone(&self) -> Self {
         IterParallelProducer {
-            split_count: self.split_count.clone(),
-            done: self.done.clone(),
+            split_count: self.split_count,
+            done: self.done,
             items: self.items.clone(),
         }
     }
 }
 
-impl<T: Send> UnindexedProducer for IterParallelProducer<T> {
+impl<'a, T: Send> UnindexedProducer for IterParallelProducer<'a, T> {
     type Item = T;
 
     fn split(self) -> (Self, Option<Self>) {
