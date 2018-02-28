@@ -10,6 +10,7 @@ use crossbeam_deque::{Deque, Stealer, Steal};
 use rayon::prelude::*;
 use rayon::iter::plumbing::*;
 use rayon::{scope, current_num_threads};
+use synchronoise::{SignalEvent, SignalKind};
 
 /// Conversion trait to convert an `Iterator` to a `ParallelIterator`.
 ///
@@ -52,32 +53,41 @@ impl<Iter: IntoIterator + Send> ParallelIterator for IterParallel<Iter>
         where C: UnindexedConsumer<Self::Item>
     {
         let done = AtomicBool::new(false);
+        let ready = SignalEvent::new(true, SignalKind::Auto);
+
         scope(|s| {
             let deque = Deque::new();
             let stealer = deque.stealer();
 
-            let signal = &done;
-            s.spawn(move |_| {
-                let mut iter = self.iter.into_iter();
+            {
+                let done = &done;
+                let ready = &ready;
 
-                loop {
-                    if !signal.load(Ordering::SeqCst) { break; }
+                s.spawn(move |_| {
+                    let mut iter = self.iter.into_iter();
 
-                    match iter.next() {
-                        Some(it) => deque.push(it),
-                        _ => break,
+                    loop {
+                        if !done.load(Ordering::SeqCst) { break; }
+
+                        match iter.next() {
+                            Some(it) => deque.push(it),
+                            _ => break,
+                        }
+
+                        ready.signal();
                     }
-                }
 
-                // if we got here, either the iterator is empty or the consumer is full - if the
-                // former, let's signal to the consumer to stop allowing splits
-                signal.store(true, Ordering::SeqCst);
-            });
+                    // if we got here, either the iterator is empty or the consumer is full - if the
+                    // former, let's signal to the consumer to stop allowing splits
+                    done.store(true, Ordering::SeqCst);
+                });
+            }
 
             let split_count = AtomicUsize::new(current_num_threads());
             let result = bridge_unindexed(IterParallelProducer {
                 split_count: &split_count,
                 done: &done,
+                ready: &ready,
                 items: stealer,
             }, consumer);
 
@@ -93,6 +103,7 @@ impl<Iter: IntoIterator + Send> ParallelIterator for IterParallel<Iter>
 struct IterParallelProducer<'a, T> {
     split_count: &'a AtomicUsize,
     done: &'a AtomicBool,
+    ready: &'a SignalEvent,
     items: Stealer<T>,
 }
 
@@ -102,6 +113,7 @@ impl<'a, T> Clone for IterParallelProducer<'a, T> {
         IterParallelProducer {
             split_count: self.split_count,
             done: self.done,
+            ready: self.ready,
             items: self.items.clone(),
         }
     }
@@ -142,7 +154,14 @@ impl<'a, T: Send> UnindexedProducer for IterParallelProducer<'a, T> {
                         return folder;
                     }
                 }
-                Steal::Empty => return folder,
+                Steal::Empty => {
+                    if self.done.load(Ordering::SeqCst) {
+                        // the iterator is out of items, no use in continuing
+                        return folder;
+                    } else {
+                        self.ready.wait();
+                    }
+                }
                 Steal::Retry => (),
             }
         }
