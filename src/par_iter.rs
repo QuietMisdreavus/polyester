@@ -136,7 +136,12 @@ impl<T: Send> UnindexedProducer for IterParallelProducer<T> {
     {
         loop {
             match self.items.steal() {
-                Steal::Data(it) => folder = folder.consume(it),
+                Steal::Data(it) => {
+                    folder = folder.consume(it);
+                    if folder.full() {
+                        return folder;
+                    }
+                }
                 Steal::Empty => return folder,
                 Steal::Retry => (),
             }
