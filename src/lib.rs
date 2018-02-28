@@ -14,7 +14,9 @@
 extern crate num_cpus;
 extern crate crossbeam_deque;
 extern crate synchronoise;
-extern crate rayon_core;
+extern crate rayon;
+
+pub mod par_iter;
 
 use std::sync::{Arc, mpsc};
 use std::sync::atomic::AtomicBool;
@@ -134,8 +136,8 @@ where
         InnerFold: Fn(Acc, T) -> Acc + Send + Sync,
         OuterFold: Fn(Acc, Acc) -> Acc
     {
-        let res = rayon_core::scope(|scope| {
-            let num_jobs = rayon_core::current_num_threads();
+        let res = rayon::scope(|scope| {
+            let num_jobs = rayon::current_num_threads();
 
             if num_jobs == 1 {
                 //it's not worth collecting the items into the hopper and spawning a thread if it's
@@ -230,7 +232,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if let (Some(iter), Some(map)) = (self.iter.take(), self.map.take()) {
-            let num_jobs = rayon_core::current_num_threads();
+            let num_jobs = rayon::current_num_threads();
 
             let hopper = Hopper::new(iter, num_jobs);
             let map = Arc::new(map);
@@ -241,7 +243,7 @@ where
                 let hopper = hopper.clone();
                 let report = report.clone();
                 let map = map.clone();
-                rayon_core::spawn(move || {
+                rayon::spawn(move || {
                     loop {
                         let item = hopper.get_item(id);
 
@@ -276,7 +278,7 @@ struct Hopper<T> {
 impl<T> Hopper<T> {
     /// Creates a new `Hopper` from the given iterator, with the given number of slots, and begins
     /// the background cache-filler worker.
-    fn new_scoped<'a, I>(iter: I, slots: usize, scope: &rayon_core::Scope<'a>) -> Arc<Hopper<T>>
+    fn new_scoped<'a, I>(iter: I, slots: usize, scope: &rayon::Scope<'a>) -> Arc<Hopper<T>>
     where
         I: Iterator<Item=T> + Send + 'a,
         T: Send + 'a,
@@ -367,7 +369,7 @@ impl<T> Hopper<T> {
 
         let hopper = ret.clone();
 
-        rayon_core::spawn(move || {
+        rayon::spawn(move || {
             let hopper = hopper;
             let fillers = fillers;
             let mut current_slot = 0;
