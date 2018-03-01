@@ -12,16 +12,16 @@
 #![doc(test(attr(allow(unused_variables))))]
 
 extern crate num_cpus;
-extern crate crossbeam;
+extern crate crossbeam_deque;
 extern crate synchronoise;
+extern crate rayon_core;
 
 use std::sync::{Arc, mpsc};
-use std::sync::atomic::{AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::mpsc::channel;
-use std::thread;
 
-use crossbeam::sync::chase_lev;
+use crossbeam_deque::{Deque, Stealer, Steal};
 use synchronoise::{SignalEvent, SignalKind};
 
 /// A trait to extend `Iterator`s with consumers that work in parallel.
@@ -134,18 +134,18 @@ where
         InnerFold: Fn(Acc, T) -> Acc + Send + Sync,
         OuterFold: Fn(Acc, Acc) -> Acc
     {
-        crossbeam::scope(|scope| {
-            let num_jobs = get_thread_count();
+        let res = rayon_core::scope(|scope| {
+            let num_jobs = rayon_core::current_num_threads();
 
             if num_jobs == 1 {
                 //it's not worth collecting the items into the hopper and spawning a thread if it's
                 //still going to be serial, just fold it inline
-                return self.fold(seed, inner_fold);
+                return Err(self.fold(seed, inner_fold));
             }
 
             let hopper = Hopper::new_scoped(self, num_jobs, scope);
             let inner_fold = Arc::new(inner_fold);
-            let (report, recv) = channel();
+            let (report, recv) = channel::<Acc>();
 
             //launch the workers
             for id in 0..num_jobs {
@@ -153,7 +153,7 @@ where
                 let acc = seed.clone();
                 let inner_fold = inner_fold.clone();
                 let report = report.clone();
-                scope.spawn(move || {
+                scope.spawn(move |_| {
                     let mut acc = acc;
 
                     loop {
@@ -170,21 +170,25 @@ where
                 });
             }
 
-            //hang up our initial channel so we don't wait for a response from it
-            drop(report);
+            Ok((seed, recv))
+        });
 
-            //collect and fold the workers' results
-            let mut acc: Option<Acc> = None;
-            for res in recv.iter() {
-                if acc.is_none() {
-                    acc = Some(res);
-                } else {
-                    acc = acc.map(|acc| outer_fold(acc, res));
+        let mut acc: Option<Acc> = None;
+        match res {
+            Ok((seed, recv)) => {
+                //collect and fold the workers' results
+                for res in recv.iter() {
+                    if acc.is_none() {
+                        acc = Some(res);
+                    } else {
+                        acc = acc.map(|acc| outer_fold(acc, res));
+                    }
                 }
-            }
 
-            acc.unwrap_or(seed)
-        })
+                acc.unwrap_or(seed)
+            }
+            Err(acc) => acc,
+        }
     }
 
     fn par_map<Map, Out>(self, map: Map) -> ParMap<I, Map, Out>
@@ -226,7 +230,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         if let (Some(iter), Some(map)) = (self.iter.take(), self.map.take()) {
-            let num_jobs = get_thread_count();
+            let num_jobs = rayon_core::current_num_threads();
 
             let hopper = Hopper::new(iter, num_jobs);
             let map = Arc::new(map);
@@ -237,7 +241,7 @@ where
                 let hopper = hopper.clone();
                 let report = report.clone();
                 let map = map.clone();
-                std::thread::spawn(move || {
+                rayon_core::spawn(move || {
                     loop {
                         let item = hopper.get_item(id);
 
@@ -261,7 +265,7 @@ where
 /// worker threads can pull from a per-thread cache.
 struct Hopper<T> {
     /// The cache of items, broken down into per-thread sub-caches.
-    cache: Vec<chase_lev::Stealer<T>>,
+    cache: Vec<Stealer<T>>,
     /// A set of associated `Condvar`s for worker threads to wait on while the background thread
     /// adds more items to its cache.
     signals: Vec<SignalEvent>,
@@ -272,7 +276,7 @@ struct Hopper<T> {
 impl<T> Hopper<T> {
     /// Creates a new `Hopper` from the given iterator, with the given number of slots, and begins
     /// the background cache-filler worker.
-    fn new_scoped<'a, I>(iter: I, slots: usize, scope: &crossbeam::Scope<'a>) -> Arc<Hopper<T>>
+    fn new_scoped<'a, I>(iter: I, slots: usize, scope: &rayon_core::Scope<'a>) -> Arc<Hopper<T>>
     where
         I: Iterator<Item=T> + Send + 'a,
         T: Send + 'a,
@@ -283,8 +287,9 @@ impl<T> Hopper<T> {
         let mut signals = Vec::<SignalEvent>::with_capacity(slots);
 
         for _ in 0..slots {
-            let (filler, stealer) = chase_lev::deque();
-            fillers.push(filler);
+            let deque = Deque::new();
+            let stealer = deque.stealer();
+            fillers.push(deque);
             cache.push(stealer);
             //start the SignalEvents as "ready" in case the filler thread gets a heard start on the
             //workers
@@ -299,7 +304,7 @@ impl<T> Hopper<T> {
 
         let hopper = ret.clone();
 
-        scope.spawn(move || {
+        scope.spawn(move |_| {
             let hopper = hopper;
             let fillers = fillers;
             let mut current_slot = 0;
@@ -345,8 +350,9 @@ impl<T> Hopper<T> {
         let mut signals = Vec::<SignalEvent>::with_capacity(slots);
 
         for _ in 0..slots {
-            let (filler, stealer) = chase_lev::deque();
-            fillers.push(filler);
+            let deque = Deque::new();
+            let stealer = deque.stealer();
+            fillers.push(deque);
             cache.push(stealer);
             //start the SignalEvents as "ready" in case the filler thread gets a heard start on the
             //workers
@@ -361,7 +367,7 @@ impl<T> Hopper<T> {
 
         let hopper = ret.clone();
 
-        thread::spawn(move || {
+        rayon_core::spawn(move || {
             let hopper = hopper;
             let fillers = fillers;
             let mut current_slot = 0;
@@ -398,9 +404,9 @@ impl<T> Hopper<T> {
     fn steal(&self, id: usize) -> Option<T> {
         loop {
             match self.cache[id].steal() {
-                chase_lev::Steal::Empty => return None,
-                chase_lev::Steal::Data(it) => return Some(it),
-                chase_lev::Steal::Abort => (),
+                Steal::Empty => return None,
+                Steal::Data(it) => return Some(it),
+                Steal::Retry => (),
             }
         }
     }
@@ -433,32 +439,6 @@ impl<T> Hopper<T> {
             //otherwise, wait for the cache-filler to get more items
             self.signals[id].wait();
         }
-    }
-}
-
-static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
-
-/// Sets the number of threads started by the [`Polyester`] adaptors.
-///
-/// [`Polyester`]: trait.Polyester.html
-///
-/// This sets an atomic counter accessed by the [`Polyester`] adaptors to calculate how many worker
-/// threads to start. Note that one extra thread will always be spawned, to handle the iterator
-/// item dispatch.
-///
-/// If this is set to zero (or never set in the first place), the adapters will spawn as many
-/// threads as the number of cores on the current system.
-pub fn set_thread_count(count: usize) {
-    THREAD_COUNT.store(count, SeqCst);
-}
-
-fn get_thread_count() -> usize {
-    let count = THREAD_COUNT.load(SeqCst);
-
-    if count == 0 {
-        num_cpus::get()
-    } else {
-        count
     }
 }
 
