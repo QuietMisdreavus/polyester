@@ -4,12 +4,13 @@
 
 //! Connecting traits and types to bridge `Iterator` and `ParallelIterator`.
 
+use std::sync::{Mutex, TryLockError};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 
 use crossbeam_deque::{Deque, Stealer, Steal};
 use rayon::prelude::*;
 use rayon::iter::plumbing::*;
-use rayon::{scope, current_num_threads};
+use rayon::current_num_threads;
 use synchronoise::{SignalEvent, SignalKind};
 
 /// Conversion trait to convert an `Iterator` to a `ParallelIterator`.
@@ -27,7 +28,7 @@ pub trait AsParallel {
     fn as_parallel(self) -> Self::Iter;
 }
 
-impl<T: IntoIterator + Send> AsParallel for T
+impl<T: Iterator + Send> AsParallel for T
     where T::Item: Send
 {
     type Iter = IterParallel<T>;
@@ -44,7 +45,7 @@ pub struct IterParallel<Iter> {
     iter: Iter,
 }
 
-impl<Iter: IntoIterator + Send> ParallelIterator for IterParallel<Iter>
+impl<Iter: Iterator + Send> ParallelIterator for IterParallel<Iter>
     where Iter::Item: Send
 {
     type Item = Iter::Item;
@@ -52,75 +53,48 @@ impl<Iter: IntoIterator + Send> ParallelIterator for IterParallel<Iter>
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
         where C: UnindexedConsumer<Self::Item>
     {
+        let split_count = AtomicUsize::new(current_num_threads());
+        let deque = Deque::new();
+        let stealer = deque.stealer();
         let done = AtomicBool::new(false);
         let ready = SignalEvent::new(true, SignalKind::Auto);
+        let iter = Mutex::new((self.iter, deque));
 
-        scope(|s| {
-            let deque = Deque::new();
-            let stealer = deque.stealer();
-
-            {
-                let done = &done;
-                let ready = &ready;
-
-                s.spawn(move |_| {
-                    let mut iter = self.iter.into_iter();
-
-                    loop {
-                        if !done.load(Ordering::SeqCst) { break; }
-
-                        match iter.next() {
-                            Some(it) => deque.push(it),
-                            _ => break,
-                        }
-
-                        ready.signal();
-                    }
-
-                    // if we got here, either the iterator is empty or the consumer is full - if the
-                    // former, let's signal to the consumer to stop allowing splits
-                    done.store(true, Ordering::SeqCst);
-                });
-            }
-
-            let split_count = AtomicUsize::new(current_num_threads());
-            let result = bridge_unindexed(IterParallelProducer {
-                split_count: &split_count,
-                done: &done,
-                ready: &ready,
-                items: stealer,
-            }, consumer);
-
-            // if we're here, either the iterator is empty or the consumer is full - if the latter,
-            // let's signal back to the iterator to stop
-            done.store(true, Ordering::SeqCst);
-
-            result
-        })
+        bridge_unindexed(IterParallelProducer {
+            split_count: &split_count,
+            done: &done,
+            ready: &ready,
+            iter: &iter,
+            items: stealer,
+        }, consumer)
     }
 }
 
-struct IterParallelProducer<'a, T> {
+struct IterParallelProducer<'a, Iter: Iterator + 'a> {
     split_count: &'a AtomicUsize,
     done: &'a AtomicBool,
     ready: &'a SignalEvent,
-    items: Stealer<T>,
+    iter: &'a Mutex<(Iter, Deque<Iter::Item>)>,
+    items: Stealer<Iter::Item>,
 }
 
 // manual clone because T doesn't need to be Clone, but the derive assumes it should be
-impl<'a, T> Clone for IterParallelProducer<'a, T> {
+impl<'a, Iter: Iterator + 'a> Clone for IterParallelProducer<'a, Iter> {
     fn clone(&self) -> Self {
         IterParallelProducer {
             split_count: self.split_count,
             done: self.done,
             ready: self.ready,
+            iter: self.iter,
             items: self.items.clone(),
         }
     }
 }
 
-impl<'a, T: Send> UnindexedProducer for IterParallelProducer<'a, T> {
-    type Item = T;
+impl<'a, Iter: Iterator + Send + 'a> UnindexedProducer for IterParallelProducer<'a, Iter>
+    where Iter::Item: Send
+{
+    type Item = Iter::Item;
 
     fn split(self) -> (Self, Option<Self>) {
         let mut count = self.split_count.load(Ordering::SeqCst);
@@ -159,7 +133,34 @@ impl<'a, T: Send> UnindexedProducer for IterParallelProducer<'a, T> {
                         // the iterator is out of items, no use in continuing
                         return folder;
                     } else {
-                        self.ready.wait();
+                        // our cache is out of items, time to load more from the iterator
+                        match self.iter.try_lock() {
+                            Ok(mut guard) => {
+                                let count = current_num_threads();
+                                let count = (count * count) * 2;
+
+                                let (ref mut iter, ref deque) = *guard;
+
+                                for _ in 0..count {
+                                    if let Some(it) = iter.next() {
+                                        deque.push(it);
+                                    } else {
+                                        self.done.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+
+                                self.ready.signal();
+                            }
+                            Err(TryLockError::WouldBlock) => {
+                                // someone else has the mutex, just sit tight until it's ready
+                                self.ready.wait();
+                            }
+                            Err(TryLockError::Poisoned(_)) => {
+                                // TODO: how to handle poison?
+                                return folder;
+                            }
+                        }
                     }
                 }
                 Steal::Retry => (),
