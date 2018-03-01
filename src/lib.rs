@@ -447,6 +447,8 @@ impl<T> Hopper<T> {
 #[cfg(test)]
 mod tests {
     use super::Polyester;
+    use par_iter::AsParallel;
+    use rayon::iter::ParallelIterator;
     use std::time::{Instant, Duration};
 
     fn secs_millis(dur: Duration) -> (u64, u32) {
@@ -460,14 +462,19 @@ mod tests {
         let after_par = Instant::now();
         let seq = (0..1_000_000).fold(0usize, |l,r| l+r);
         let after_seq = Instant::now();
+        let iter = (0..1_000_000).as_parallel().reduce(|| 0usize, |l,r| l+r);
+        let after_iter = Instant::now();
 
         let par_dur = secs_millis(after_par.duration_since(before));
         let seq_dur = secs_millis(after_seq.duration_since(after_par));
+        let iter_dur = secs_millis(after_iter.duration_since(after_seq));
         println!("");
-        println!("    parallel fold:   {}.{:03}s", par_dur.0, par_dur.1);
-        println!("    sequential fold: {}.{:03}s", seq_dur.0, seq_dur.1);
+        println!("    parallel fold:      {}.{:03}s", par_dur.0, par_dur.1);
+        println!("    reduce as parallel: {}.{:03}s", iter_dur.0, iter_dur.1);
+        println!("    sequential fold:    {}.{:03}s", seq_dur.0, seq_dur.1);
 
         assert_eq!(par, seq);
+        assert_eq!(iter, seq);
     }
 
     #[test]
@@ -477,16 +484,22 @@ mod tests {
         let after_par = Instant::now();
         let mut seq = (0..1_000_000).map(|x| x*x).collect::<Vec<usize>>();
         let after_seq = Instant::now();
+        let mut iter = (0..1_000_000).as_parallel().map(|x| x*x).collect::<Vec<usize>>();
+        let after_iter = Instant::now();
 
         par.sort();
         seq.sort();
+        iter.sort();
 
         let par_dur = secs_millis(after_par.duration_since(before));
         let seq_dur = secs_millis(after_seq.duration_since(after_par));
+        let iter_dur = secs_millis(after_iter.duration_since(after_seq));
         println!("");
-        println!("    parallel map:   {}.{:03}s", par_dur.0, par_dur.1);
-        println!("    sequential map: {}.{:03}s", seq_dur.0, seq_dur.1);
+        println!("    parallel map:    {}.{:03}s", par_dur.0, par_dur.1);
+        println!("    map as parallel: {}.{:03}s", iter_dur.0, iter_dur.1);
+        println!("    sequential map:  {}.{:03}s", seq_dur.0, seq_dur.1);
 
         assert_eq!(par, seq);
+        assert_eq!(iter, seq);
     }
 }
