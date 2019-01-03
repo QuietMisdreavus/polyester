@@ -2,6 +2,12 @@
 
 some parallel iterator adapters for rust
 
+**Please note:** This library has been largely superceded by the introduction of `rayon`'s
+[`ParallelBridge`][] trait. The implementation of that trait is based on this library, and use of it
+allows you to use all of rayon's parallel adaptors, not just `map` and `fold`.
+
+[`ParallelBridge`]: https://docs.rs/rayon/1.0.3/rayon/iter/trait.ParallelBridge.html
+
 [Documentation] | [(manually-updated docs for master)][doc-dev]
 
 [Documentation]: https://docs.rs/polyester
